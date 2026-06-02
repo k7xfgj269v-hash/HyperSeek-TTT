@@ -1,5 +1,7 @@
 # HyperSeek-TTT
 
+> Independent reimplementation. Not affiliated with DeepSeek-AI or the authors of the referenced papers. All code is original; references to DeepSeek V4-Pro and arXiv papers are for attribution only. Released under MIT license.
+
 Toy-Scale Implementierung der DeepSeek V4-Pro Architektur + 2026 Test-Time Learning (In-Place TTT). Pipeline läuft end-to-end; eigentliche Wirksamkeitsprüfung bleibt dem Scale-up vorbehalten.
 
 ## Architekturübersicht
