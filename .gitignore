@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# venv (项目根目录本身就是 venv root)
+bin/
+include/
+lib/
+lib64/
+share/
+pyvenv.cfg
+
+# 模型 / checkpoint / 数据
+*.pt
+*.pt.bak
+*.ckpt
+*.safetensors
+*.bin
+*.npz
+*.npy
+
+# 日志 / 输出
+*.log
+logs/
+runs/
+wandb/
+*.out
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 临时 / 备份
+*.bak
+*.tmp
+.cache/

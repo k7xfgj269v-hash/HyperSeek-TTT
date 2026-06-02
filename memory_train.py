@@ -1,0 +1,266 @@
+import argparse
+import random
+from types import SimpleNamespace
+
+import torch
+import torch.nn.functional as F
+
+from data import TABLE, encode, decode
+from model import DeepSeekMini, cfg
+from optim import Muon, split_params
+
+
+DIGITS = "0123456789"
+MODES = ["none", "transient", "persistent"]
+
+
+def make_cfg(seq_len, persistent_memory):
+    run_cfg = SimpleNamespace(**{k: v for k, v in vars(cfg.__class__).items() if not k.startswith('__')})
+    for k, v in vars(cfg).items():
+        setattr(run_cfg, k, v)
+    run_cfg.seq_len = seq_len
+    run_cfg.ttt_persistent_memory = persistent_memory
+    return run_cfg
+
+
+def make_model(device, seq_len, mode):
+    run_cfg = make_cfg(seq_len, persistent_memory=(mode == "persistent"))
+    return DeepSeekMini(run_cfg).to(device)
+
+
+def set_mode(model, mode):
+    if mode == "none":
+        model.set_memory_enabled(False, write_enabled=False)
+    elif mode == "transient":
+        model.set_memory_enabled(True, write_enabled=False)
+    elif mode == "persistent":
+        model.set_memory_enabled(True, write_enabled=True)
+    else:
+        raise ValueError(f"unknown mode: {mode}")
+
+
+def random_secret(length):
+    return "".join(random.choice(DIGITS) for _ in range(length))
+
+
+def filler_item():
+    a = random.choice(DIGITS)
+    b = random.choice(DIGITS)
+    c = str((int(a) + int(b)) % 10)
+    return f"{a}+{b}={c}"
+
+
+def secret_episode(secret_len=4, n_fillers=40):
+    secret = random_secret(secret_len)
+    fillers = [filler_item() for _ in range(n_fillers)]
+    pos = random.randrange(len(fillers) + 1)
+    fillers.insert(pos, f"9={secret}")
+    context = ",".join(fillers) + ","
+    query = "9="
+    return context, query, secret
+
+
+def split_chunks(text, chunk_len):
+    ids = encode(text)
+    return [ids[i:i + chunk_len] for i in range(0, len(ids), chunk_len)]
+
+
+def functional_memory_update(model, h, W_mem, create_graph):
+    atlas = model.atlas
+    B, T, D = h.shape
+    w = min(atlas.window, T - 1)
+    if w < 1:
+        return W_mem
+
+    W_state = atlas.W + W_mem
+    h_curr = h[:, -w - 1:-1, :].reshape(-1, D)
+    h_next = h[:, -w:, :].reshape(-1, D)
+    pred = F.linear(h_curr, W_state)
+    target = h_next - h_curr
+    loss = ((pred - target) ** 2).sum(-1).mean()
+    g_W = torch.autograd.grad(loss, W_state, create_graph=create_graph, retain_graph=create_graph)[0]
+    scale = (1.0 / (g_W.norm() + 1e-12)).clamp(max=1.0)
+    return atlas.retention * W_mem - atlas.inner_lr * g_W * scale
+
+
+def build_functional_memory(model, context, device, chunk_len, create_graph, accumulate=True):
+    """Build fast-weight W_mem from context, chunked.
+
+    accumulate=True: persistent — W_mem 跨 chunk 累积
+    accumulate=False: transient — 每 chunk 重新从 zero base 算，返回最后 chunk 的 W_mem
+    """
+    W_mem = torch.zeros_like(model.atlas.W)
+    for chunk in split_chunks(context, chunk_len):
+        x = torch.tensor([chunk], dtype=torch.long, device=device)
+        h = model.backbone_hidden(x)
+        base = W_mem if accumulate else torch.zeros_like(W_mem)
+        W_mem = functional_memory_update(model, h, base, create_graph=create_graph)
+    return W_mem
+
+
+def logits_with_memory(model, ids, W_mem, device):
+    x = torch.tensor([ids], dtype=torch.long, device=device)
+    h = model.backbone_hidden(x)
+    atlas = model.atlas
+    delta = F.linear(h, atlas.W + W_mem)
+    gate = torch.sigmoid(atlas.gate(h))
+    return model.logits_from_hidden(h + gate * delta)
+
+
+def target_loss_with_memory(model, query, secret, W_mem, device):
+    prompt = query + secret[:-1]
+    target = torch.tensor(encode(secret), dtype=torch.long, device=device)
+    logits = logits_with_memory(model, encode(prompt), W_mem, device)
+    logits = logits[0, -len(secret):, :]
+    return F.cross_entropy(logits, target)
+
+
+@torch.no_grad()
+def generate_secret(model, query, secret_len, device):
+    out = query
+    model.set_memory_enabled(True, write_enabled=False)
+    for _ in range(secret_len):
+        x = torch.tensor([encode(out)], dtype=torch.long, device=device)
+        logits, _ = model(x)
+        nxt = int(logits[0, -1].argmax(-1).item())
+        out += decode([nxt])
+    return out[len(query):]
+
+
+def generate_secret_with_memory(model, query, secret_len, W_mem, device):
+    out = query
+    for _ in range(secret_len):
+        logits = logits_with_memory(model, encode(out), W_mem, device)
+        nxt = int(logits[0, -1].argmax(-1).item())
+        out += decode([nxt])
+    return out[len(query):]
+
+
+def train_one_mode(args, mode, device):
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    model = make_model(device, args.seq_len, mode)
+    model.train()
+    muon_params, adamw_params = split_params(model)
+    opt_muon = Muon(muon_params, lr=cfg.muon_lr)
+    opt_adamw = torch.optim.AdamW(adamw_params, lr=args.lr)
+    chunk_len = min(args.chunk_len, args.seq_len)
+
+    for step in range(1, args.steps + 1):
+        opt_muon.zero_grad()
+        opt_adamw.zero_grad()
+        total_loss = torch.tensor(0.0, device=device)
+        last_mem_norm = 0.0
+        for _ in range(args.batch_size):
+            context, query, secret = secret_episode(args.secret_len, args.fillers)
+            model.reset_memory()
+            if mode == "none":
+                W_mem = torch.zeros_like(model.atlas.W)
+            elif mode == "transient":
+                W_mem = build_functional_memory(
+                    model, context, device, chunk_len,
+                    create_graph=True, accumulate=False,
+                )
+            elif mode == "persistent":
+                W_mem = build_functional_memory(
+                    model, context, device, chunk_len,
+                    create_graph=True, accumulate=True,
+                )
+            last_mem_norm = W_mem.detach().norm().item()
+            total_loss = total_loss + target_loss_with_memory(model, query, secret, W_mem, device)
+        loss = total_loss / args.batch_size
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(adamw_params, max_norm=args.grad_clip)
+        opt_muon.step()
+        opt_adamw.step()
+
+        if step % args.log_every == 0 or step == 1:
+            gate = getattr(model.atlas, "last_gate", 0.0) or 0.0
+            print(f"{mode:10s} step={step:4d} loss={loss.item():.4f} gate={gate:.4f} mem={last_mem_norm:.4f}")
+
+    return model
+
+
+@torch.no_grad()
+def eval_model(args, model, mode, device):
+    model.eval()
+    chunk_len = min(args.chunk_len, args.seq_len)
+    exact = 0
+    token_ok = 0
+    total_tokens = args.eval_episodes * args.secret_len
+    gate_sum = 0.0
+    mem_sum = 0.0
+
+    for _ in range(args.eval_episodes):
+        context, query, secret = secret_episode(args.secret_len, args.fillers)
+        model.reset_memory()
+        if mode == "none":
+            W_mem = torch.zeros_like(model.atlas.W)
+        elif mode == "transient":
+            with torch.enable_grad():
+                W_mem = build_functional_memory(
+                    model, context, device, chunk_len,
+                    create_graph=False, accumulate=False,
+                )
+        elif mode == "persistent":
+            with torch.enable_grad():
+                W_mem = build_functional_memory(
+                    model, context, device, chunk_len,
+                    create_graph=False, accumulate=True,
+                )
+        pred = generate_secret_with_memory(model, query, args.secret_len, W_mem.detach(), device)
+        exact += int(pred == secret)
+        token_ok += sum(int(a == b) for a, b in zip(pred, secret))
+        gate_sum += getattr(model.atlas, "last_gate", 0.0) or 0.0
+        mem_sum += W_mem.detach().norm().item()
+
+    return {
+        "exact": exact / args.eval_episodes,
+        "token": token_ok / total_tokens,
+        "gate": gate_sum / args.eval_episodes,
+        "mem": mem_sum / args.eval_episodes,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train hidden-secret recall with memory ablations.")
+    parser.add_argument("--modes", nargs="+", choices=MODES, default=MODES)
+    parser.add_argument("--steps", type=int, default=300)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--eval-episodes", type=int, default=100)
+    parser.add_argument("--seq-len", type=int, default=96)
+    parser.add_argument("--chunk-len", type=int, default=64)
+    parser.add_argument("--fillers", type=int, default=40)
+    parser.add_argument("--secret-len", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    args = parser.parse_args()
+
+    device = args.device
+    if device == "auto":
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+    print(
+        f"device={device} steps={args.steps} batch={args.batch_size} "
+        f"seq_len={args.seq_len} chunk_len={min(args.chunk_len, args.seq_len)} "
+        f"secret_len={args.secret_len}"
+    )
+
+    results = {}
+    for mode in args.modes:
+        model = train_one_mode(args, mode, device)
+        results[mode] = eval_model(args, model, mode, device)
+
+    print("summary")
+    for mode in args.modes:
+        r = results[mode]
+        print(
+            f"{mode:10s} exact={r['exact']:.3f} token={r['token']:.3f} "
+            f"gate={r['gate']:.4f} mem_norm={r['mem']:.4f}"
+        )
+
+
+if __name__ == "__main__":
+    main()
