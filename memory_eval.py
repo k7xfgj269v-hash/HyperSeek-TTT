@@ -5,12 +5,9 @@ from types import SimpleNamespace
 
 import torch
 
-from data import TABLE, decode, encode
+from data import TABLE, decode, encode, kv_recall_episode, needle_episode, rule_episode
 from model import CKPT, DeepSeekMini, cfg
 from memory_train import build_functional_memory, logits_with_memory
-
-
-DIGITS = "0123456789"
 
 
 def make_model(device, persistent_memory=False, load_ckpt=True):
@@ -22,11 +19,6 @@ def make_model(device, persistent_memory=False, load_ckpt=True):
     if load_ckpt and os.path.exists(CKPT):
         model.load_state_dict(torch.load(CKPT, map_location=device))
     return model
-
-
-def split_chunks(text, chunk_len):
-    ids = encode(text)
-    return [ids[i:i + chunk_len] for i in range(0, len(ids), chunk_len)]
 
 
 def generate_text_with_memory(model, prompt, n_tokens, W_mem, device):
@@ -43,17 +35,15 @@ def eval_episode(model, context, query, target, device, chunk_len, mode):
     if mode == "none":
         W_mem = torch.zeros_like(model.atlas.W)
     elif mode == "transient":
-        with torch.enable_grad():
-            W_mem = build_functional_memory(
-                model, context, device, chunk_len,
-                create_graph=False, accumulate=False,
-            )
+        W_mem = build_functional_memory(
+            model, context, device, chunk_len,
+            create_graph=False, accumulate=False,
+        )
     elif mode == "persistent":
-        with torch.enable_grad():
-            W_mem = build_functional_memory(
-                model, context, device, chunk_len,
-                create_graph=False, accumulate=True,
-            )
+        W_mem = build_functional_memory(
+            model, context, device, chunk_len,
+            create_graph=False, accumulate=True,
+        )
     else:
         raise ValueError(f"unknown mode: {mode}")
 
@@ -64,43 +54,6 @@ def eval_episode(model, context, query, target, device, chunk_len, mode):
     mem = W_mem.detach().norm().item()
     token_ok = sum(int(a == b) for a, b in zip(pred, target))
     return pred == target, token_ok, len(target), gate, mem
-
-
-def random_digits(n):
-    return "".join(random.choice(DIGITS) for _ in range(n))
-
-
-def kv_recall_episode(n_pairs=8, secret_len=1):
-    n_pairs = min(n_pairs, len(DIGITS))
-    keys = random.sample(DIGITS, n_pairs)
-    vals = [random_digits(secret_len) for _ in keys]
-    pairs = list(zip(keys, vals))
-    random.shuffle(pairs)
-    q_key, q_val = random.choice(pairs)
-    context = ",".join(f"{k}={v}" for k, v in pairs) + ","
-    query = f"{q_key}="
-    return context, query, q_val
-
-
-def needle_episode(n_fillers=20, secret_len=1):
-    secret = random_digits(secret_len)
-    fillers = [f"{random.choice(DIGITS)}+{random.choice(DIGITS)}={random.choice(DIGITS)}" for _ in range(n_fillers)]
-    pos = random.randrange(len(fillers) + 1)
-    fillers.insert(pos, f"9={secret}")
-    context = ",".join(fillers) + ","
-    query = "9="
-    return context, query, secret
-
-
-def rule_episode(n_rules=6, secret_len=1):
-    lhs = random.sample(DIGITS, n_rules)
-    rhs = [random_digits(secret_len) for _ in lhs]
-    rules = list(zip(lhs, rhs))
-    random.shuffle(rules)
-    q_key, q_val = random.choice(rules)
-    context = ",".join(f"{k}={v}" for k, v in rules) + ","
-    query = f"{q_key}="
-    return context, query, q_val
 
 
 TASKS = {

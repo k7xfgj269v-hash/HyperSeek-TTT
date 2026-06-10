@@ -5,12 +5,11 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from data import TABLE, encode, decode
+from data import TABLE, encode, decode, secret_episode, split_chunks
 from model import DeepSeekMini, cfg
 from optim import Muon, split_params
 
 
-DIGITS = "0123456789"
 MODES = ["none", "transient", "persistent"]
 
 
@@ -39,72 +38,26 @@ def set_mode(model, mode):
         raise ValueError(f"unknown mode: {mode}")
 
 
-def random_secret(length):
-    return "".join(random.choice(DIGITS) for _ in range(length))
-
-
-def filler_item():
-    a = random.choice(DIGITS)
-    b = random.choice(DIGITS)
-    c = str((int(a) + int(b)) % 10)
-    return f"{a}+{b}={c}"
-
-
-def secret_episode(secret_len=4, n_fillers=40):
-    secret = random_secret(secret_len)
-    fillers = [filler_item() for _ in range(n_fillers)]
-    pos = random.randrange(len(fillers) + 1)
-    fillers.insert(pos, f"9={secret}")
-    context = ",".join(fillers) + ","
-    query = "9="
-    return context, query, secret
-
-
-def split_chunks(text, chunk_len):
-    ids = encode(text)
-    return [ids[i:i + chunk_len] for i in range(0, len(ids), chunk_len)]
-
-
-def functional_memory_update(model, h, W_mem, create_graph):
-    atlas = model.atlas
-    B, T, D = h.shape
-    w = min(atlas.window, T - 1)
-    if w < 1:
-        return W_mem
-
-    W_state = atlas.W + W_mem
-    h_curr = h[:, -w - 1:-1, :].reshape(-1, D)
-    h_next = h[:, -w:, :].reshape(-1, D)
-    pred = F.linear(h_curr, W_state)
-    target = h_next - h_curr
-    loss = ((pred - target) ** 2).sum(-1).mean()
-    g_W = torch.autograd.grad(loss, W_state, create_graph=create_graph, retain_graph=create_graph)[0]
-    scale = (1.0 / (g_W.norm() + 1e-12)).clamp(max=1.0)
-    return atlas.retention * W_mem - atlas.inner_lr * g_W * scale
-
-
 def build_functional_memory(model, context, device, chunk_len, create_graph, accumulate=True):
-    """Build fast-weight W_mem from context, chunked.
+    """Build fast-weight W_mem from context, chunked, via InPlaceTTT.update_memory.
 
     accumulate=True: persistent — W_mem 跨 chunk 累积
     accumulate=False: transient — 每 chunk 重新从 zero base 算，返回最后 chunk 的 W_mem
     """
-    W_mem = torch.zeros_like(model.atlas.W)
+    atlas = model.atlas
+    W_mem = torch.zeros_like(atlas.W)
     for chunk in split_chunks(context, chunk_len):
         x = torch.tensor([chunk], dtype=torch.long, device=device)
         h = model.backbone_hidden(x)
-        base = W_mem if accumulate else torch.zeros_like(W_mem)
-        W_mem = functional_memory_update(model, h, base, create_graph=create_graph)
+        base = W_mem if accumulate else torch.zeros_like(atlas.W)
+        W_mem = atlas.update_memory(h, base, differentiable=create_graph)
     return W_mem
 
 
 def logits_with_memory(model, ids, W_mem, device):
     x = torch.tensor([ids], dtype=torch.long, device=device)
     h = model.backbone_hidden(x)
-    atlas = model.atlas
-    delta = F.linear(h, atlas.W + W_mem)
-    gate = torch.sigmoid(atlas.gate(h))
-    return model.logits_from_hidden(h + gate * delta)
+    return model.logits_from_hidden(model.atlas.apply_memory(h, W_mem))
 
 
 def target_loss_with_memory(model, query, secret, W_mem, device):
@@ -197,17 +150,15 @@ def eval_model(args, model, mode, device):
         if mode == "none":
             W_mem = torch.zeros_like(model.atlas.W)
         elif mode == "transient":
-            with torch.enable_grad():
-                W_mem = build_functional_memory(
-                    model, context, device, chunk_len,
-                    create_graph=False, accumulate=False,
-                )
+            W_mem = build_functional_memory(
+                model, context, device, chunk_len,
+                create_graph=False, accumulate=False,
+            )
         elif mode == "persistent":
-            with torch.enable_grad():
-                W_mem = build_functional_memory(
-                    model, context, device, chunk_len,
-                    create_graph=False, accumulate=True,
-                )
+            W_mem = build_functional_memory(
+                model, context, device, chunk_len,
+                create_graph=False, accumulate=True,
+            )
         pred = generate_secret_with_memory(model, query, args.secret_len, W_mem.detach(), device)
         exact += int(pred == secret)
         token_ok += sum(int(a == b) for a, b in zip(pred, secret))

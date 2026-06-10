@@ -44,6 +44,12 @@ class Config:
     train_route_w = 0.1
     train_grad_clip = 1.0
 
+    train_mem_every = 4
+    train_mem_batch = 8
+    train_mem_chunk = 32
+    train_mem_pairs = 8
+    train_mem_secret_len = 2
+
 
 cfg = Config()
 
@@ -368,6 +374,32 @@ class InPlaceTTT(nn.Module):
         g = (2.0 / w) * torch.einsum('bni,bnj->bij', resid, h_curr)
         scale = (1.0 / (g.flatten(1).norm(dim=1) + 1e-12)).clamp(max=1.0)
         return g * scale.view(B, 1, 1), L
+
+    def update_memory(self, h, W_mem, differentiable=False):
+        """One chunk's fast-weight step: retention * W_mem - lr * g(W + W_mem).
+
+        Shared write path for the chunked/episodic consumers (memory_train,
+        train.memory_step). W_mem is (D, D) or per-sample (B, D, D); the
+        result is per-sample. differentiable=True lets outer backprop flow
+        through the update into the backbone and slow weights.
+        """
+        T = h.shape[1]
+        if min(self.window, T - 1) < 1:
+            return W_mem
+        g, _ = self._inner_grad(h, self.W + W_mem, differentiable=differentiable)
+        return self.retention * W_mem - self.inner_lr * g
+
+    def apply_memory(self, h, W_mem):
+        """Read path: h + gate(h) * ((W + W_mem) h). Updates last_gate."""
+        W_fast = self.W + W_mem
+        if W_fast.dim() == 2:
+            delta = F.linear(h, W_fast)
+        else:
+            delta = torch.einsum('bij,btj->bti', W_fast, h)
+        gate_val = torch.sigmoid(self.gate(h))
+        with torch.no_grad():
+            self.last_gate = gate_val.mean().item()
+        return h + gate_val * delta
 
     def forward(self, h):
         B, T, D = h.shape
