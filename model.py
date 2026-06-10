@@ -345,6 +345,30 @@ class InPlaceTTT(nn.Module):
             return self.W + self.W_mem
         return self.W
 
+    def _inner_grad(self, h, W_base, differentiable=False):
+        """Closed-form per-sample gradient of the hidden-delta inner loss.
+
+        L_b = mean_n ||W h_n - (h_{n+1} - h_n)||^2 over the last window of
+        sample b, dL_b/dW = (2/w) * resid_b^T @ h_curr_b. The batch dimension
+        stays separate: one gradient per sample, never pooled across the
+        batch. differentiable=True keeps the graph through h and W_base so
+        outer backprop can flow through the inner update (functional path).
+        """
+        B, T, D = h.shape
+        w = min(self.window, T - 1)
+        h_curr = h[:, -w - 1:-1, :]
+        h_next = h[:, -w:, :]
+        if not differentiable:
+            h_curr = h_curr.detach()
+            h_next = h_next.detach()
+            W_base = W_base.detach()
+        pred = h_curr @ W_base.transpose(-1, -2)
+        resid = pred - (h_next - h_curr)
+        L = resid.pow(2).sum(-1).mean(-1)
+        g = (2.0 / w) * torch.einsum('bni,bnj->bij', resid, h_curr)
+        scale = (1.0 / (g.flatten(1).norm(dim=1) + 1e-12)).clamp(max=1.0)
+        return g * scale.view(B, 1, 1), L
+
     def forward(self, h):
         B, T, D = h.shape
         w = min(self.window, T - 1)
@@ -362,37 +386,31 @@ class InPlaceTTT(nn.Module):
                 self.last_mem_norm = self.W_mem.norm().item()
             return out
 
-        with torch.enable_grad():
-            W = W_state.detach().requires_grad_(True)
-            h_curr = h[:, -w - 1:-1, :].reshape(-1, D).detach()
-            h_next = h[:, -w:, :].reshape(-1, D).detach()
-            pred = F.linear(h_curr, W)
-            target = h_next - h_curr
-            L = ((pred - target) ** 2).sum(-1).mean()
-            grads = torch.autograd.grad(L, [W], create_graph=False)
-
-        g_W = grads[0]
-        norm = g_W.norm() + 1e-12
-        scale = (1.0 / norm).clamp(max=1.0)
-        g_W = g_W * scale
+        g, L = self._inner_grad(h, W_state)
 
         if self.persistent_memory and self.memory_enabled:
-            W_mem_t = self.retention * self.W_mem - self.inner_lr * g_W
+            W_mem_t = self.retention * self.W_mem - self.inner_lr * g
             W_t = self.W + W_mem_t
             if self.write_enabled:
+                if B != 1:
+                    raise ValueError(
+                        "persistent W_mem write with batch size > 1 is undefined: "
+                        "per-sample fast weights cannot be merged into one buffer. "
+                        "Use batch size 1 for episodes or set write_enabled=False."
+                    )
                 with torch.no_grad():
-                    self.W_mem.copy_(W_mem_t.detach())
+                    self.W_mem.copy_(W_mem_t[0].detach())
         else:
-            W_t = self.retention * self.W - self.inner_lr * g_W
-        delta = F.linear(h, W_t)
+            W_t = self.retention * self.W - self.inner_lr * g
+        delta = torch.einsum('bij,btj->bti', W_t, h)
         gate_val = torch.sigmoid(self.gate(h))
 
         with torch.no_grad():
             self.last_gate = gate_val.mean().item()
-            self.last_L = L.detach().item()
+            self.last_L = L.detach().mean().item()
             self.last_delta_norm = (gate_val * delta).norm().item()
             self.last_h_norm = h.norm().item()
-            self.last_update_norm = (self.inner_lr * g_W).norm().item()
+            self.last_update_norm = (self.inner_lr * g).flatten(1).norm(dim=1).mean().item()
             self.last_mem_norm = self.W_mem.norm().item()
 
         return h + gate_val * delta
