@@ -4,54 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from config import Config, cfg
+
 CKPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hyperseek_ttt.pt')
-
-
-class Config:
-    vocab_size = 18
-
-    d_model = 128
-    n_heads = 4
-    n_layers = 4
-    seq_len = 96
-
-    kv_lora_rank = 32
-    q_lora_rank = 64
-
-    qk_nope_dim = 16
-    qk_rope_dim = 16
-    v_head_dim = 32
-
-    n_routed_experts = 4
-    n_shared_experts = 1
-    n_activated_experts = 2
-    moe_inter_dim = 128
-
-    n_hc = 4
-
-    n_mtp_heads = 1
-    mtp_loss_weight = 0.1
-
-    atlas_window = 32
-    atlas_inner_lr = 1e-2
-    atlas_retention = 0.99
-    ttt_persistent_memory = False
-
-    muon_lr = 1e-2
-    train_lr = 5e-4
-    train_n_steps = 2000
-    train_batch_size = 32
-    train_route_w = 0.1
-    train_grad_clip = 1.0
-
-    train_mem_every = 4
-    train_mem_batch = 8
-    train_mem_chunk = 32
-    train_mem_pairs = 8
-    train_mem_secret_len = 2
-
-
-cfg = Config()
 
 
 def apply_rope(x, cos, sin):
@@ -68,14 +23,6 @@ def apply_rope(x, cos, sin):
         cos_full = cos_full.unsqueeze(0)
         sin_full = sin_full.unsqueeze(0)
     return x * cos_full + rotated_ * sin_full
-
-
-def make_long_effective_mask(T, S, R, window_size, device):
-    raise NotImplementedError(
-        "make_long_effective_mask is a long-context placeholder. "
-        "The old implementation had incompatible S/R/T shapes and must be "
-        "redesigned before use."
-    )
 
 
 class RMSNorm(nn.Module):

@@ -1,6 +1,6 @@
 import argparse
 import random
-from types import SimpleNamespace
+from dataclasses import replace
 
 import torch
 import torch.nn.functional as F
@@ -8,22 +8,14 @@ import torch.nn.functional as F
 from data import TABLE, encode, decode, secret_episode, split_chunks
 from model import DeepSeekMini, cfg
 from optim import Muon, split_params
+from runlog import JsonlLogger
 
 
 MODES = ["none", "transient", "persistent"]
 
 
-def make_cfg(seq_len, persistent_memory):
-    run_cfg = SimpleNamespace(**{k: v for k, v in vars(cfg.__class__).items() if not k.startswith('__')})
-    for k, v in vars(cfg).items():
-        setattr(run_cfg, k, v)
-    run_cfg.seq_len = seq_len
-    run_cfg.ttt_persistent_memory = persistent_memory
-    return run_cfg
-
-
 def make_model(device, seq_len, mode):
-    run_cfg = make_cfg(seq_len, persistent_memory=(mode == "persistent"))
+    run_cfg = replace(cfg, seq_len=seq_len, ttt_persistent_memory=(mode == "persistent"))
     return DeepSeekMini(run_cfg).to(device)
 
 
@@ -89,7 +81,7 @@ def generate_secret_with_memory(model, query, secret_len, W_mem, device):
     return out[len(query):]
 
 
-def train_one_mode(args, mode, device):
+def train_one_mode(args, mode, device, logger=None):
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     model = make_model(device, args.seq_len, mode)
@@ -127,8 +119,11 @@ def train_one_mode(args, mode, device):
         opt_muon.step()
         opt_adamw.step()
 
+        gate = getattr(model.atlas, "last_gate", 0.0) or 0.0
+        if logger is not None:
+            logger.log(mode=mode, step=step, loss=round(loss.item(), 4),
+                       gate=round(gate, 4), mem=round(last_mem_norm, 4))
         if step % args.log_every == 0 or step == 1:
-            gate = getattr(model.atlas, "last_gate", 0.0) or 0.0
             print(f"{mode:10s} step={step:4d} loss={loss.item():.4f} gate={gate:.4f} mem={last_mem_norm:.4f}")
 
     return model
@@ -188,6 +183,7 @@ def main():
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--log-dir", default=None)
     args = parser.parse_args()
 
     device = args.device
@@ -199,10 +195,12 @@ def main():
         f"secret_len={args.secret_len}"
     )
 
+    logger = JsonlLogger('memory_train', root=args.log_dir)
     results = {}
     for mode in args.modes:
-        model = train_one_mode(args, mode, device)
+        model = train_one_mode(args, mode, device, logger=logger)
         results[mode] = eval_model(args, model, mode, device)
+        logger.log(mode=mode, kind='eval', **{k: round(v, 4) for k, v in results[mode].items()})
 
     print("summary")
     for mode in args.modes:
@@ -211,6 +209,8 @@ def main():
             f"{mode:10s} exact={r['exact']:.3f} token={r['token']:.3f} "
             f"gate={r['gate']:.4f} mem_norm={r['mem']:.4f}"
         )
+    print(f"metrics {logger.path}")
+    logger.close()
 
 
 if __name__ == "__main__":

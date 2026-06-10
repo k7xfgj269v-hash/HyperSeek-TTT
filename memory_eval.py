@@ -1,7 +1,7 @@
 import argparse
 import os
 import random
-from types import SimpleNamespace
+from dataclasses import replace
 
 import torch
 
@@ -11,10 +11,7 @@ from memory_train import build_functional_memory, logits_with_memory
 
 
 def make_model(device, persistent_memory=False, load_ckpt=True):
-    run_cfg = SimpleNamespace(**{k: v for k, v in vars(cfg.__class__).items() if not k.startswith('__')})
-    for k, v in vars(cfg).items():
-        setattr(run_cfg, k, v)
-    run_cfg.ttt_persistent_memory = persistent_memory
+    run_cfg = replace(cfg, ttt_persistent_memory=persistent_memory)
     model = DeepSeekMini(run_cfg).to(device).eval()
     if load_ckpt and os.path.exists(CKPT):
         model.load_state_dict(torch.load(CKPT, map_location=device))

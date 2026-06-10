@@ -17,7 +17,7 @@ Toy-Scale Implementierung der DeepSeek V4-Pro Architektur + 2026 Test-Time Learn
 - **InPlaceTTT** — Einzelner Linear-Adapter + Gate; hidden-delta NTP inner loss; optional persistent `W_mem` über Chunks akkumuliert (arXiv 2604.06169)
 - **Muon + AdamW** — ndim≥2 nimmt Muon, bias / RMSNorm weight / token_emb nehmen AdamW (arXiv 2502.16982)
 
-**Konkrete Parameter siehe `model.py` → `Config`** — alle skalenabhängigen Felder (d_model / n_layers / kv_lora_rank / moe_inter_dim / Trainings-Hyperparameter …) sind dort zentral; beim Scale-up nur eine Stelle ändern.
+**Konkrete Parameter siehe `config.py` → `Config`** (dataclass) — alle skalenabhängigen Felder (d_model / n_layers / kv_lora_rank / moe_inter_dim / Trainings-Hyperparameter …) sind dort zentral; Varianten via `dataclasses.replace(cfg, ...)`, beim Scale-up nur eine Stelle ändern.
 
 Bewusst ausgelassen: FP4-Training, DSA / CSA / HCA / Hybrid Attention (V4-Pros Long-Context-Dreigespann, bei Toy-Skala bedeutungslos).
 
@@ -25,21 +25,31 @@ Bewusst ausgelassen: FP4-Training, DSA / CSA / HCA / Hybrid Attention (V4-Pros L
 
 ```
 HyperSeek-TTT/
-├── model.py        Architektur (Config + alle nn.Module)
-├── data.py         Toy CoT Arithmetik Tokenizer + Dataset
-├── optim.py        Muon Optimizer
-├── train.py        Trainings-Einstieg (auto MPS, grad clip, monitor)
+├── config.py       Config dataclass (alle Hyperparameter)
+├── model.py        Architektur (alle nn.Module)
+├── data.py         Tokenizer, Arithmetik-Dataset, Episode-Generatoren
+├── optim.py        Muon Optimizer + Parameter-Split
+├── train.py        Trainings-Einstieg (NTP + chunked-recall Mixture)
 ├── eval.py         Inferenz + Experten-Spezialisierungstest
 ├── memory_train.py Hidden-Secret Recall Training + 3-Modi Fair Compare
 ├── memory_eval.py  Episode Memory + Chunked Recall Ablation
+├── runlog.py       JSONL-Metrik-Logger (logs/*.jsonl)
 ├── transformer.py  v0 Baseline (MiniGPT), als Referenz erhalten
-└── bin/python      venv python 3.14
+├── tests/          pytest Regressionssuite
+└── requirements.txt
 ```
 
 ## Verwendung
 
 ```bash
 cd HyperSeek-TTT
+
+# Setup (venv im Repo-Root; --without-scm-ignore-files schützt die .gitignore)
+python3.14 -m venv . --without-scm-ignore-files
+./bin/pip install -r requirements.txt
+
+# Tests
+./bin/python -m pytest tests/
 
 # Haupttraining (auto MPS; Schritte / Batches / lr siehe cfg.train_*)
 ./bin/python train.py
@@ -59,10 +69,14 @@ cd HyperSeek-TTT
 
 ## Trainings-Monitoring
 
-`train.py` druckt alle 100 Schritte eine Zeile:
+`train.py` mischt alle `cfg.train_mem_every` Schritte einen chunked-recall
+Memory-Step ein (Secret liegt in Chunks außerhalb der Query-Attention; nur
+W_mem kann es tragen — das gibt dem Gate echten Lerndruck). Alle 100
+Schritte wird eine Zeile gedruckt, jeder Schritt landet in `logs/*.jsonl`
+(`step / kind / loss / route / gate / amp_avg / amp_max`):
 
 ```
-Step  XXXX loss X.XXXX route X.XXXX mhc_amp avg X.XXX max X.XXX
+Step  XXXX loss X.XXXX route X.XXXX gate X.XXXX mhc_amp avg X.XXX max X.XXX
                                          ↑ nur Backbone-HC gezählt, MTP-intern ausgeschlossen
 ```
 
@@ -143,7 +157,7 @@ Monitoring-Felder sind exponiert; beim Scale-up Kurven über mehrere Schritte pl
 
 ## Designmängel
 
-1. **Toy-Arithmetik kann Test-Time Learning nicht validieren** — InPlaceTTT bei geschlossenen deterministischen Aufgaben Gate im Wesentlichen Leerlauf (keine langreichweitigen Abhängigkeiten zu erinnern). Validierung erfordert Long-Context needle-in-haystack oder assoziative Recall-Aufgaben + BPE Tokenizer.
+1. **Toy-Arithmetik allein kann Test-Time Learning nicht validieren** — bei geschlossenen deterministischen Aufgaben bleibt das Gate Leerlauf. Seit der chunked-recall Mixture in `train.py` bekommt das Gate echten Druck (gemessen: 0.018 → ~0.1 in 400 Schritten); für belastbare Aussagen bleibt BPE + natürliche Sprache nötig.
 
 2. **Anpfropfung auf DeepSeek-V2-Lite extrem kostspielig** — alle Dimensionen passen nicht, Tokenizer komplett anders, Architekturen stark unterschiedlich (V2-Lite hat kein mHC / MTP / InPlaceTTT). "Anpfropfung" ≈ Projekt neu schreiben.
 
@@ -153,17 +167,18 @@ Monitoring-Felder sind exponiert; beim Scale-up Kurven über mehrere Schritte pl
 
 5. **mHC-lite empfindlich gegenüber `n_hc`** — `n_hc=4` → 24 perms sicher; `n_hc≥8` → Buffer-Explosion, K-Cap-Subsampling nötig (gemäß Paper Teilmenge < n_hc!).
 
-6. **`make_long_effective_mask`** — `raise NotImplementedError` Platzhalter, für zukünftige Long-Memory-Designs reserviert. Bei tatsächlicher Verwendung muss neu geschrieben werden.
+6. ~~**`make_long_effective_mask`**~~ — toter Platzhalter ohne Aufrufer, entfernt.
 
-7. **InPlaceTTT Inner Step über Samples geteilt** — `reshape(-1, D)` fasst Batch und Window zusammen für `L_mem` Berechnung. `memory_train.py` umgeht via Batch=1 seriell; Haupt-`train.py` mit Batch > 1 leidet weiterhin unter Cross-Sample Fast-Weight Verschmutzung.
+7. ~~**InPlaceTTT Inner Step über Samples geteilt**~~ — **behoben**: geschlossene Form des Inner-Gradienten pro Sample (`_inner_grad`, (B, D, D) Fast Weights); Regressionstest erzwingt batch==serial Äquivalenz.
 
 8. **MTP mit komplettem eingebettetem DeepSeekBlock** — konsistent mit V3 Paper, aber bei Toy-Skala MTP-Anteil groß und stört Backbone-Trainingsdiagnose. Scale-up mildert automatisch.
 
 ## Versteckte Constraints (Stolperfallen)
 
 - `model(idx, return_mtp=True)` muss `mtp_tokens=next_tok_ids` mitgeben (Fallback ist raise, nicht mehr silent wrong)
-- `seq_len` Änderung erfordert anschließend Model-Rekonstruktion (`rope_cos / causal_mask` sind Buffer, nicht dynamisch erweiterbar). `memory_train.py` macht via `make_cfg(seq_len, ...)` neues cfg → neues Model — korrekte Vorgehensweise
-- InPlaceTTTs `persistent_memory` wird bei der Konstruktion festgelegt (`cfg.ttt_persistent_memory`), kann nicht mid-training gewechselt werden; `memory_train.py` erstellt pro Modus ein neues Model
+- `rope_cos / causal_mask` wachsen seit dem Längen-Decoupling lazy (`_rope_mask`); jede Länge läuft, aber jenseits der Trainingslänge gibt RoPE keine Qualitätsgarantie
+- Persistenter `W_mem`-**Write** via `InPlaceTTT.forward` verlangt Batch 1 (per-Sample Fast Weights lassen sich nicht in einen Buffer mergen) — sonst ValueError; Read-only geht batched
+- InPlaceTTTs `persistent_memory` wird bei der Konstruktion festgelegt (`cfg.ttt_persistent_memory`), kann nicht mid-training gewechselt werden; `memory_train.py` erstellt pro Modus ein neues Model (`dataclasses.replace(cfg, ...)`)
 - Haupt-`train.py` verwendet Attributnamen `model.atlas` für InPlaceTTT-Instanz (Benennung aus Historie, state_dict-Kompatibilität nicht gebrochen; tatsächlicher Typ ist InPlaceTTT)
 
 ## Referenzen

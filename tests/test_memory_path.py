@@ -109,5 +109,11 @@ def test_train_mixture_smoke(tmp_path, monkeypatch):
     import train as train_module
     monkeypatch.setattr(train_module, 'CKPT', str(tmp_path / 'smoke.pt'))
     model = make_test_model(n_routed_experts=4)
-    train_module.train(model, n_steps=4, batch_size=4, device='cpu')
+    train_module.train(model, n_steps=4, batch_size=4, device='cpu', log_dir=str(tmp_path))
     assert (tmp_path / 'smoke.pt').exists()
+    logs = list(tmp_path.glob('train_*.jsonl'))
+    assert len(logs) == 1
+    import json
+    rows = [json.loads(line) for line in logs[0].read_text().splitlines()]
+    assert len(rows) == 4
+    assert {r['kind'] for r in rows} == {'ntp', 'mem'}

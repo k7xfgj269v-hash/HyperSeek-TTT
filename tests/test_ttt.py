@@ -1,31 +1,21 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from types import SimpleNamespace
+from dataclasses import replace
 
-from model import Config, DeepSeekMini, InPlaceTTT
+from config import Config
+from model import DeepSeekMini, InPlaceTTT
 
 
 def small_cfg(**overrides):
-    cfg = SimpleNamespace(**{k: v for k, v in vars(Config).items() if not k.startswith('__')})
-    cfg.d_model = 32
-    cfg.n_heads = 2
-    cfg.n_layers = 2
-    cfg.seq_len = 48
-    cfg.kv_lora_rank = 16
-    cfg.q_lora_rank = 16
-    cfg.qk_nope_dim = 8
-    cfg.qk_rope_dim = 8
-    cfg.v_head_dim = 8
-    cfg.n_routed_experts = 2
-    cfg.n_shared_experts = 1
-    cfg.n_activated_experts = 1
-    cfg.moe_inter_dim = 32
-    cfg.n_hc = 2
-    cfg.atlas_window = 8
-    for k, v in overrides.items():
-        setattr(cfg, k, v)
-    return cfg
+    base = Config(
+        d_model=32, n_heads=2, n_layers=2, seq_len=48,
+        kv_lora_rank=16, q_lora_rank=16,
+        qk_nope_dim=8, qk_rope_dim=8, v_head_dim=8,
+        n_routed_experts=2, n_shared_experts=1, n_activated_experts=1,
+        moe_inter_dim=32, n_hc=2, atlas_window=8,
+    )
+    return replace(base, **overrides)
 
 
 def autograd_inner_grad(atlas, h_b):

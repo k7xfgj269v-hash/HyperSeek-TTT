@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from model import cfg, CKPT, DeepSeekMini, MoE, HyperConnect
 from data import PAD, make_batch, make_recall_batch
 from optim import Muon, split_params
+from runlog import JsonlLogger
 
 
 def memory_step(model, batch_size, chunk_len, n_pairs, secret_len, device):
@@ -26,11 +27,12 @@ def memory_step(model, batch_size, chunk_len, n_pairs, secret_len, device):
     return F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
 
 
-def train(model, n_steps=None, batch_size=None, lr=None, device='cpu', route_w=None):
+def train(model, n_steps=None, batch_size=None, lr=None, device='cpu', route_w=None, log_dir=None):
     if n_steps is None: n_steps = cfg.train_n_steps
     if batch_size is None: batch_size = cfg.train_batch_size
     if lr is None: lr = cfg.train_lr
     if route_w is None: route_w = cfg.train_route_w
+    logger = JsonlLogger('train', root=log_dir)
     model.to(device).train()
     muon_params, adamw_params = split_params(model)
     opt_muon = Muon(muon_params, lr=cfg.muon_lr)
@@ -80,14 +82,19 @@ def train(model, n_steps=None, batch_size=None, lr=None, device='cpu', route_w=N
         # for m in model.modules():
         #     if isinstance(m, MoE) and not m.is_mtp:
         #         m.update_router_bias(cfg.bias_update_speed)
+        amps = [hc.last_amp for blk in model.blocks for hc in (blk.hc_attn, blk.hc_ffn) if hc.last_amp is not None]
+        avg_amp = sum(amps) / len(amps) if amps else 0.0
+        max_amp = max(amps) if amps else 0.0
+        gate = model.atlas.last_gate if model.atlas.last_gate is not None else 0.0
+        kind = 'mem' if (mem_every and step % mem_every == mem_every - 1) else 'ntp'
+        logger.log(step=step, kind=kind, loss=round(loss.item(), 4), route=round(loss_route.item(), 4),
+                   gate=round(gate, 4), amp_avg=round(avg_amp, 3), amp_max=round(max_amp, 3))
         if step % 100 == 0:
-            amps = [hc.last_amp for blk in model.blocks for hc in (blk.hc_attn, blk.hc_ffn) if hc.last_amp is not None]
-            avg_amp = sum(amps) / len(amps) if amps else 0.0
-            max_amp = max(amps) if amps else 0.0
-            gate = model.atlas.last_gate if model.atlas.last_gate is not None else 0.0
             print(f"Step {step:4d} loss {loss.item():.4f} route {loss_route.item():.4f} gate {gate:.4f} mhc_amp avg {avg_amp:.3f} max {max_amp:.3f}")
     torch.save(model.state_dict(), CKPT)
     print(f"saved {CKPT}")
+    print(f"metrics {logger.path}")
+    logger.close()
     return model
 
 
