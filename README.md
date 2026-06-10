@@ -147,6 +147,13 @@ Aktuell ist InPlaceTTT Default; `AtlasMemory` ist nicht im Source-Tree. Bei Beda
 - ~~**TTT Doppel-Gate**~~ — **implementiert** als `ttt_gated_memory` (Read-Gate bestand schon; Write-Gate gewichtet Inner-Loss-Positionen, Forget-Gate ersetzt fixe Retention). Auf Toy-Skala im 100-Schritt-A/B kein messbarer Unterschied zur Baseline (by design: init == Baseline) — Wirksamkeitsprüfung bleibt dem Scale-up vorbehalten
 - **Reasoning Token Format**: Toy CoT inline; beim Scale-up `<think>...</think>` als explizites Segment-Token hinzufügen
 
+### Geprüfte und zurückgestellte Richtungen
+
+- **Adaptive Chunk-Größe nach Informationsdichte** — bricht die Fixed-Length-Chunk-Ausrichtung, auf der die gebatchten per-Sample Fast Weights beruhen; das Ziel (redundanten Inhalt nicht einschreiben) deckt das Write-Gate bereits pro Token statt pro Block ab. Erst bei Scale-up mit echtem Compute-Druck neu bewerten.
+- **Schichtweise differenzierte Update-Frequenz** — Prämisse trifft hier nicht zu: es gibt genau einen Top-Level-TTT-Adapter, keine per-Layer Fast Weights. Mehrstufiges TTT wäre ein neues Architektur-Experiment, keine Optimierung des Bestands.
+- **Kontrastiver Zusatzverlust / Informationsbottleneck** — auf Toy-Skala nicht messbar (selbst direktere Eingriffe liegen im Rauschen, siehe A/B-Ergebnisse); erst mit Scale-up-Messstand sinnvoll.
+- **Fast-Weight-Quantisierung (4-bit)** — der Fast-Weight-Zustand ist d_model² = 64 KB; Quantisierung brächte hier nichts außer Komplexität (und MPS hat keine fertigen 4-bit Kernel). Relevant erst ab großem d_model.
+
 ### Trainings-Monitoring (alle 100 Schritte diese Vier im Set)
 
 | Indikator | Worauf achten |
