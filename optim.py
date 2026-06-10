@@ -57,7 +57,7 @@ def split_params(model):
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if 'token_emb' in name or p.ndim < 2:
+        if 'token_emb' in name or p.ndim < 2 or min(p.shape) == 1:
             adamw_params.append(p)
         else:
             muon_params.append(p)
