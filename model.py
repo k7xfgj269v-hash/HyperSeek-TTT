@@ -425,7 +425,7 @@ class DeepSeekMini(nn.Module):
         cos, sin = precompute(cfg.seq_len, cfg.qk_rope_dim)
         self.register_buffer('rope_cos', cos, persistent=False)
         self.register_buffer('rope_sin', sin, persistent=False)
-        m = torch.tril(torch.ones(cfg.seq_len, cfg.seq_len))
+        m = torch.ones(cfg.seq_len, cfg.seq_len, dtype=torch.bool).tril()
         self.register_buffer('causal_mask', m, persistent=False)
         self.blocks = nn.ModuleList([DeepSeekBlock(cfg) for _ in range(cfg.n_layers)])
         self.atlas = InPlaceTTT(
@@ -452,16 +452,28 @@ class DeepSeekMini(nn.Module):
         if hasattr(self.atlas, 'set_memory_enabled'):
             self.atlas.set_memory_enabled(enabled, write_enabled)
 
+    def _rope_mask(self, T):
+        """Lazily grown RoPE / causal-mask caches; any T is valid.
+
+        Beyond cfg.seq_len this only guarantees the model runs — RoPE gives
+        no quality guarantee past the trained length.
+        """
+        if self.rope_cos.size(0) < T:
+            n = max(T, 2 * self.rope_cos.size(0))
+            cos, sin = precompute(n, self.cfg.qk_rope_dim)
+            self.rope_cos = cos.to(self.rope_cos.device)
+            self.rope_sin = sin.to(self.rope_sin.device)
+        if self.causal_mask.size(0) < T:
+            n = max(T, 2 * self.causal_mask.size(0))
+            m = torch.ones(n, n, dtype=torch.bool, device=self.causal_mask.device).tril()
+            self.causal_mask = m
+        return self.rope_cos[:T], self.rope_sin[:T], self.causal_mask[:T, :T]
+
     def backbone_hidden(self, idx):
         B, T = idx.shape
-        max_T = self.rope_cos.size(0)
-        if T > max_T:
-            raise ValueError(f"input length {T} exceeds model context length {max_T}")
         x = self.token_emb(idx)
         X = x.unsqueeze(-2).expand(-1, -1, self.cfg.n_hc, -1).contiguous()
-        cos = self.rope_cos[:T]
-        sin = self.rope_sin[:T]
-        mask = self.causal_mask[:T, :T]
+        cos, sin, mask = self._rope_mask(T)
         for block in self.blocks:
             X = block(X, cos, sin, mask)
         return X.mean(-2)
@@ -479,9 +491,7 @@ class DeepSeekMini(nn.Module):
             return logits, None
         if mtp_tokens is None:
             raise ValueError("return_mtp=True requires mtp_tokens (next-token ids of same length as idx)")
-        cos = self.rope_cos[:T]
-        sin = self.rope_sin[:T]
-        mask = self.causal_mask[:T, :T]
+        cos, sin, mask = self._rope_mask(T)
         h = self.final_norm(x)
         mtp_hidden = []
         for head in self.mtp:
