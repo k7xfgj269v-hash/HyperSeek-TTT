@@ -14,7 +14,7 @@ Toy-Scale Implementierung der DeepSeek V4-Pro Architektur + 2026 Test-Time Learn
 
 **Top-Ebene**:
 - **MTP** — Multi-Token Prediction als Hilfsverlust, 1 head mit eingebettetem komplettem DeepSeekBlock (V3)
-- **InPlaceTTT** — Einzelner Linear-Adapter + Gate; hidden-delta NTP inner loss; optional persistent `W_mem` über Chunks akkumuliert (arXiv 2604.06169)
+- **InPlaceTTT** — Einzelner Linear-Adapter + Gate; hidden-delta NTP inner loss; per-Sample Fast Weights (B, D, D); optional persistent `W_mem` über Chunks akkumuliert (arXiv 2604.06169). Opt-in `ttt_gated_memory`: Write-Gate (gewichtet Inner-Loss-Positionen) + gelerntes Forget-Gate statt fixer Retention (Titans-Stil, init exakt am Baseline-Punkt); `ttt_max_mem_norm` als Drift-Schranke für Streaming
 - **Muon + AdamW** — ndim≥2 nimmt Muon, bias / RMSNorm weight / token_emb nehmen AdamW (arXiv 2502.16982)
 
 **Konkrete Parameter siehe `config.py` → `Config`** (dataclass) — alle skalenabhängigen Felder (d_model / n_layers / kv_lora_rank / moe_inter_dim / Trainings-Hyperparameter …) sind dort zentral; Varianten via `dataclasses.replace(cfg, ...)`, beim Scale-up nur eine Stelle ändern.
@@ -65,6 +65,9 @@ python3.14 -m venv . --without-scm-ignore-files
 # Hidden-Secret Recall Training (3-Modi Fair Compare)
 ./bin/python memory_train.py --steps 300 --batch-size 16 --secret-len 1
 ./bin/python memory_train.py --steps 100 --batch-size 8  --secret-len 4
+
+# Gated-Memory-Ablation (Write-/Forget-Gate + Norm-Schranke, init == Baseline)
+./bin/python memory_train.py --modes persistent --steps 100 --gated --max-mem-norm 5.0
 ```
 
 ## Trainings-Monitoring
@@ -141,7 +144,7 @@ Aktuell ist InPlaceTTT Default; `AtlasMemory` ist nicht im Source-Tree. Bei Beda
 
 ### Mögliche Erweiterungs-Richtungen (Hooks vorhanden, neue Logik nötig)
 
-- **TTT Doppel-Gate**: Aktuell InPlaceTTT einzelnes Sigmoid-Gate; Read-Gate + Write-Gate trennen, um W_mem Lesen / Schreiben getrennt zu steuern
+- ~~**TTT Doppel-Gate**~~ — **implementiert** als `ttt_gated_memory` (Read-Gate bestand schon; Write-Gate gewichtet Inner-Loss-Positionen, Forget-Gate ersetzt fixe Retention). Auf Toy-Skala im 100-Schritt-A/B kein messbarer Unterschied zur Baseline (by design: init == Baseline) — Wirksamkeitsprüfung bleibt dem Scale-up vorbehalten
 - **Reasoning Token Format**: Toy CoT inline; beim Scale-up `<think>...</think>` als explizites Segment-Token hinzufügen
 
 ### Trainings-Monitoring (alle 100 Schritte diese Vier im Set)

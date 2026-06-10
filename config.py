@@ -31,6 +31,8 @@ class Config:
     atlas_inner_lr: float = 1e-2
     atlas_retention: float = 0.99
     ttt_persistent_memory: bool = False
+    ttt_gated_memory: bool = False
+    ttt_max_mem_norm: float = 0.0
 
     muon_lr: float = 1e-2
     train_lr: float = 5e-4

@@ -14,8 +14,11 @@ from runlog import JsonlLogger
 MODES = ["none", "transient", "persistent"]
 
 
-def make_model(device, seq_len, mode):
-    run_cfg = replace(cfg, seq_len=seq_len, ttt_persistent_memory=(mode == "persistent"))
+def make_model(device, seq_len, mode, gated=False, max_mem_norm=0.0):
+    run_cfg = replace(
+        cfg, seq_len=seq_len, ttt_persistent_memory=(mode == "persistent"),
+        ttt_gated_memory=gated, ttt_max_mem_norm=max_mem_norm,
+    )
     return DeepSeekMini(run_cfg).to(device)
 
 
@@ -84,7 +87,7 @@ def generate_secret_with_memory(model, query, secret_len, W_mem, device):
 def train_one_mode(args, mode, device, logger=None):
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    model = make_model(device, args.seq_len, mode)
+    model = make_model(device, args.seq_len, mode, gated=args.gated, max_mem_norm=args.max_mem_norm)
     model.train()
     muon_params, adamw_params = split_params(model)
     opt_muon = Muon(muon_params, lr=cfg.muon_lr)
@@ -184,6 +187,8 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
     parser.add_argument("--log-dir", default=None)
+    parser.add_argument("--gated", action="store_true", help="write/forget gates statt fixer retention")
+    parser.add_argument("--max-mem-norm", type=float, default=0.0, help="W_mem Norm-Schranke, 0 = aus")
     args = parser.parse_args()
 
     device = args.device

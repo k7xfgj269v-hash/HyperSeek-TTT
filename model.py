@@ -256,6 +256,8 @@ class InPlaceTTT(nn.Module):
         inner_lr=1e-2,
         retention=0.99,
         persistent_memory=False,
+        gated_memory=False,
+        max_mem_norm=0.0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -265,6 +267,8 @@ class InPlaceTTT(nn.Module):
         self.persistent_memory = persistent_memory
         self.memory_enabled = persistent_memory
         self.write_enabled = persistent_memory
+        self.gated_memory = gated_memory
+        self.max_mem_norm = max_mem_norm
 
         self.W = nn.Parameter(torch.empty(d_model, d_model))
         nn.init.zeros_(self.W)
@@ -273,6 +277,14 @@ class InPlaceTTT(nn.Module):
         self.gate = nn.Linear(d_model, 1)
         nn.init.zeros_(self.gate.weight)
         nn.init.constant_(self.gate.bias, -4.0)
+
+        if gated_memory:
+            self.write_gate = nn.Linear(d_model, 1)
+            nn.init.zeros_(self.write_gate.weight)
+            nn.init.constant_(self.write_gate.bias, 4.0)
+            self.forget_gate = nn.Linear(d_model, 1)
+            nn.init.zeros_(self.forget_gate.weight)
+            nn.init.constant_(self.forget_gate.bias, math.log(retention / (1.0 - retention)))
 
         self.last_gate = None
         self.last_L = None
@@ -309,7 +321,8 @@ class InPlaceTTT(nn.Module):
         """
         B, T, D = h.shape
         w = min(self.window, T - 1)
-        h_curr = h[:, -w - 1:-1, :]
+        h_curr_raw = h[:, -w - 1:-1, :]
+        h_curr = h_curr_raw
         h_next = h[:, -w:, :]
         if not differentiable:
             h_curr = h_curr.detach()
@@ -317,24 +330,52 @@ class InPlaceTTT(nn.Module):
             W_base = W_base.detach()
         pred = h_curr @ W_base.transpose(-1, -2)
         resid = pred - (h_next - h_curr)
-        L = resid.pow(2).sum(-1).mean(-1)
-        g = (2.0 / w) * torch.einsum('bni,bnj->bij', resid, h_curr)
+        if self.gated_memory:
+            s = torch.sigmoid(self.write_gate(h_curr_raw))
+            L = (s.squeeze(-1) * resid.pow(2).sum(-1)).mean(-1)
+            g = (2.0 / w) * torch.einsum('bni,bnj->bij', s * resid, h_curr)
+        else:
+            L = resid.pow(2).sum(-1).mean(-1)
+            g = (2.0 / w) * torch.einsum('bni,bnj->bij', resid, h_curr)
         scale = (1.0 / (g.flatten(1).norm(dim=1) + 1e-12)).clamp(max=1.0)
         return g * scale.view(B, 1, 1), L
 
+    def _retention(self, h):
+        """Fixed retention, or per-sample learned forgetting over the window.
+
+        The forget gate initializes at logit(retention), so a gated model
+        starts exactly at the fixed-retention baseline.
+        """
+        if not self.gated_memory:
+            return self.retention
+        w = min(self.window, h.shape[1] - 1)
+        h_curr = h[:, -w - 1:-1, :]
+        return torch.sigmoid(self.forget_gate(h_curr)).mean(dim=1, keepdim=True)
+
+    def _clamp_mem(self, W_mem):
+        if self.max_mem_norm <= 0:
+            return W_mem
+        if W_mem.dim() == 2:
+            n = W_mem.norm()
+            return W_mem * (self.max_mem_norm / (n + 1e-12)).clamp(max=1.0)
+        n = W_mem.flatten(1).norm(dim=1).view(-1, 1, 1)
+        return W_mem * (self.max_mem_norm / (n + 1e-12)).clamp(max=1.0)
+
     def update_memory(self, h, W_mem, differentiable=False):
-        """One chunk's fast-weight step: retention * W_mem - lr * g(W + W_mem).
+        """One chunk's fast-weight step: r * W_mem - lr * g(W + W_mem).
 
         Shared write path for the chunked/episodic consumers (memory_train,
         train.memory_step). W_mem is (D, D) or per-sample (B, D, D); the
         result is per-sample. differentiable=True lets outer backprop flow
-        through the update into the backbone and slow weights.
+        through the update into the backbone and slow weights. r is the
+        fixed retention or, with gated_memory, the learned forget gate;
+        max_mem_norm > 0 clamps the result against unbounded drift.
         """
         T = h.shape[1]
         if min(self.window, T - 1) < 1:
             return W_mem
         g, _ = self._inner_grad(h, self.W + W_mem, differentiable=differentiable)
-        return self.retention * W_mem - self.inner_lr * g
+        return self._clamp_mem(self._retention(h) * W_mem - self.inner_lr * g)
 
     def apply_memory(self, h, W_mem):
         """Read path: h + gate(h) * ((W + W_mem) h). Updates last_gate."""
@@ -366,9 +407,10 @@ class InPlaceTTT(nn.Module):
             return out
 
         g, L = self._inner_grad(h, W_state)
+        r = self._retention(h)
 
         if self.persistent_memory and self.memory_enabled:
-            W_mem_t = self.retention * self.W_mem - self.inner_lr * g
+            W_mem_t = self._clamp_mem(r * self.W_mem - self.inner_lr * g)
             W_t = self.W + W_mem_t
             if self.write_enabled:
                 if B != 1:
@@ -380,7 +422,7 @@ class InPlaceTTT(nn.Module):
                 with torch.no_grad():
                     self.W_mem.copy_(W_mem_t[0].detach())
         else:
-            W_t = self.retention * self.W - self.inner_lr * g
+            W_t = r * self.W - self.inner_lr * g
         delta = torch.einsum('bij,btj->bti', W_t, h)
         gate_val = torch.sigmoid(self.gate(h))
 
@@ -413,6 +455,8 @@ class DeepSeekMini(nn.Module):
             inner_lr=cfg.atlas_inner_lr,
             retention=cfg.atlas_retention,
             persistent_memory=getattr(cfg, 'ttt_persistent_memory', False),
+            gated_memory=getattr(cfg, 'ttt_gated_memory', False),
+            max_mem_norm=getattr(cfg, 'ttt_max_mem_norm', 0.0),
         )
         self.final_norm = RMSNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
